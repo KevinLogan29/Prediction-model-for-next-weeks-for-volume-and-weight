@@ -6,8 +6,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
-
-import shap  # Feature importance
+import shap
 
 print("scikit-learn version:", sklearn.__version__)
 
@@ -16,36 +15,40 @@ print("scikit-learn version:", sklearn.__version__)
 # -----------------------------
 df = pd.read_csv("Volume_Weight_Prediction_Model.csv")
 
+# Normalize column names
 df.columns = df.columns.str.strip().str.lower()
 
-# Compute Volume = Sets * Reps
-if "sets" in df.columns and "reps" in df.columns:
-    df["volume"] = df["sets"] * df["reps"]
-
 # Ensure numeric
-numeric_cols = ["rpe", "volume", "weight"]
+numeric_cols = ["rpe", "volume", "weight", "deltaweight_next", "deltareps_next"]
 df[numeric_cols] = df[numeric_cols].astype(float)
 
-# Sort and compute future shifts
+# Sort and add cycle identifier
 df = df.sort_values(by=["exercise", "week"]).reset_index(drop=True)
+df["cycle"] = df.groupby("exercise")["week"].transform(lambda x: (x.diff() <= 0).cumsum())
+
+# Compute future shifts
 df["weight_next"] = df.groupby("exercise")["weight"].shift(-1)
-df["reps_next"] = df.groupby("exercise")["reps"].shift(-1)
 df["volume_next"] = df.groupby("exercise")["volume"].shift(-1)
 
-# Compute deltas
-df["deltaweight_next"] = df["weight_next"] - df["weight"]
-df["deltareps_next"] = df["reps_next"] - df["reps"]
+# Use provided deltas if available, otherwise compute
+df["deltaweight_next"] = df["deltaweight_next"].fillna(df["weight_next"] - df["weight"])
+df["deltareps_next"] = df["deltareps_next"].fillna(0)  # Placeholder, as reps not provided
 
-# Drop missing "next" rows
-df = df.dropna(subset=["weight_next", "reps_next", "volume_next"])
+# Forward-fill any remaining missing deltas within exercise
+df[["deltaweight_next", "deltareps_next"]] = df.groupby("exercise")[["deltaweight_next", "deltareps_next"]].ffill()
+
+# Drop rows with missing "next" values
+df = df.dropna(subset=["weight_next", "volume_next"])
 
 print("\n===== Missing Values =====")
 print(df.isnull().sum())
 
 print("\n===== Dataset Info =====")
 print(df.info())
+
 print("\n===== Dataset Head =====")
 print(df.head())
+
 print("\n===== Descriptive Statistics =====")
 print(df.describe())
 
@@ -63,9 +66,9 @@ X_scaled = pd.DataFrame(scaler_X.fit_transform(X), columns=X.columns)
 # -----------------------------
 # 3. Train/Test split + evaluation
 # -----------------------------
-X_train, X_test, yv_train, yv_test = train_test_split(X_scaled, y_volume, test_size=0.2, random_state=42)
-_, _, yd_train, yd_test = train_test_split(X_scaled, y_dweight, test_size=0.2, random_state=42)
-_, _, yr_train, yr_test = train_test_split(X_scaled, y_dreps, test_size=0.2, random_state=42)
+X_train, X_test, yv_train, yv_test = train_test_split(X_scaled, y_volume, test_size=0.1, random_state=42)
+_, _, yd_train, yd_test = train_test_split(X_scaled, y_dweight, test_size=0.1, random_state=42)
+_, _, yr_train, yr_test = train_test_split(X_scaled, y_dreps, test_size=0.1, random_state=42)
 
 # Train models
 rf_volume = RandomForestRegressor(n_estimators=100, random_state=42)
@@ -82,10 +85,7 @@ y_pred_dr = rf_dreps.predict(X_test)
 
 # Evaluation
 def get_rmse(y_true, y_pred):
-    try:
-        return mean_squared_error(y_true, y_pred, squared=False)
-    except TypeError:
-        return np.sqrt(mean_squared_error(y_true, y_pred))
+    return np.sqrt(mean_squared_error(y_true, y_pred))
 
 rmse_vol = get_rmse(yv_test, y_pred_vol)
 rmse_dw = get_rmse(yd_test, y_pred_dw)
@@ -112,7 +112,7 @@ plt.title("SHAP Summary Plot (Volume Prediction)")
 shap.summary_plot(shap_values_vol, X_scaled, plot_type="dot", show=False)
 plt.tight_layout()
 plt.savefig("shap_summary_volume.png")
-plt.show()
+plt.close()
 
 explainer_dw = shap.TreeExplainer(rf_dweight)
 shap_values_dw = explainer_dw.shap_values(X_scaled)
@@ -120,7 +120,15 @@ plt.title("SHAP Summary Plot (ΔWeight Prediction)")
 shap.summary_plot(shap_values_dw, X_scaled, plot_type="dot", show=False)
 plt.tight_layout()
 plt.savefig("shap_summary_dweight.png")
-plt.show()
+plt.close()
+
+explainer_dr = shap.TreeExplainer(rf_dreps)
+shap_values_dr = explainer_dr.shap_values(X_scaled)
+plt.title("SHAP Summary Plot (ΔReps Prediction)")
+shap.summary_plot(shap_values_dr, X_scaled, plot_type="dot", show=False)
+plt.tight_layout()
+plt.savefig("shap_summary_dreps.png")
+plt.close()
 
 # -----------------------------
 # 6. Predicted vs Measured Plots
@@ -135,7 +143,7 @@ fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 axes = axes.flatten()
 
 for i, (label, (y_true_all, model)) in enumerate(targets.items()):
-    X_tr, X_te, y_tr, y_te = train_test_split(X_scaled, y_true_all, test_size=0.2, random_state=42)
+    X_tr, X_te, y_tr, y_te = train_test_split(X_scaled, y_true_all, test_size=0.1, random_state=42)
     y_hat = model.predict(X_te)
     ax = axes[i]
     ax.scatter(y_te, y_hat, alpha=0.3, edgecolor="k")
@@ -148,4 +156,86 @@ for i, (label, (y_true_all, model)) in enumerate(targets.items()):
 
 plt.tight_layout()
 plt.savefig("predicted_vs_measured.png")
-plt.show()
+plt.close()
+
+# -----------------------------
+# 7. Next week predictions
+# -----------------------------
+exercises = df["exercise"].unique()
+predictions = []
+
+for ex in exercises:
+    last_row = df[df["exercise"] == ex].sort_values(by=["cycle", "week"]).iloc[-1]
+    input_df = pd.DataFrame({
+        "rpe": [last_row["rpe"]],
+        "volume": [last_row["volume"]],
+        "weight": [last_row["weight"]]
+    })
+    input_scaled = pd.DataFrame(scaler_X.transform(input_df), columns=input_df.columns)
+
+    pred_volume = rf_volume.predict(input_scaled)[0]
+    pred_dweight = rf_dweight.predict(input_scaled)[0]
+    pred_dreps = rf_dreps.predict(input_scaled)[0]
+
+    predictions.append({
+        "exercise": ex,
+        "week": last_row["week"] + 1,
+        "volume": pred_volume,
+        "deltaweight": pred_dweight,
+        "deltareps": pred_dreps
+    })
+
+pred_df = pd.DataFrame(predictions)
+pred_df.to_csv("next_week_predictions.csv", index=False)
+
+print("\n===== Next Week Predictions =====")
+print(pred_df)
+
+# -----------------------------
+# 8. Combine historical + predictions
+# -----------------------------
+combined_list = []
+for ex in exercises:
+    hist = df[df["exercise"] == ex][["week", "volume", "deltaweight_next", "deltareps_next", "cycle"]].copy()
+    hist.rename(columns={"deltaweight_next": "deltaweight", "deltareps_next": "deltareps"}, inplace=True)
+    hist["exercise"] = ex
+    combined_list.append(hist)
+
+    pred_row = pred_df[pred_df["exercise"] == ex][["week", "volume", "deltaweight", "deltareps"]].copy()
+    pred_row["exercise"] = ex
+    pred_row["cycle"] = df[df["exercise"] == ex]["cycle"].max()
+    combined_list.append(pred_row)
+
+df_plot = pd.concat(combined_list, ignore_index=True).sort_values(by=["exercise", "cycle", "week"])
+
+# -----------------------------
+# 9. Plot dual y-axis line chart
+# -----------------------------
+for ex in exercises:
+    plt.figure(figsize=(10, 6))
+    ax1 = plt.gca()
+    ax2 = ax1.twinx()
+    ex_data = df_plot[df_plot["exercise"] == ex]
+    for cycle in ex_data["cycle"].unique():
+        cycle_data = ex_data[ex_data["cycle"] == cycle]
+        ax1.plot(cycle_data["week"], cycle_data["volume"], marker='o', label=f"Volume (Cycle {cycle})")
+        ax2.plot(cycle_data["week"], cycle_data["deltaweight"], marker='x', linestyle='--', label=f"ΔWeight (Cycle {cycle})")
+        ax2.plot(cycle_data["week"], cycle_data["deltareps"], marker='s', linestyle='--', label=f"ΔReps (Cycle {cycle})")
+        if cycle == ex_data["cycle"].max():
+            next_week = cycle_data[cycle_data["week"] == cycle_data["week"].max()]
+            ax1.text(next_week["week"].values[0], next_week["volume"].values[0] * 1.05,
+                     f"{next_week['volume'].values[0]:.0f}", color='blue', ha='center')
+            ax2.text(next_week["week"].values[0], next_week["deltaweight"].values[0] * 1.05,
+                     f"{next_week['deltaweight'].values[0]:.1f}", color='red', ha='center')
+            ax2.text(next_week["week"].values[0], next_week["deltareps"].values[0] * 1.05,
+                     f"{next_week['deltareps'].values[0]:.1f}", color='green', ha='center')
+    ax1.set_xlabel("Week")
+    ax1.set_ylabel("Volume", color="blue")
+    ax2.set_ylabel("ΔWeight / ΔReps", color="red")
+    plt.title(f"Progression for {ex}")
+    ax1.legend(ax1.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0],
+               ax1.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1], loc="upper left")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f"progression_{ex}.png")
+    plt.close()
