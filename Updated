@@ -1,0 +1,151 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sklearn
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+
+import shap  # Feature importance
+
+print("scikit-learn version:", sklearn.__version__)
+
+# -----------------------------
+# 1. Load dataset
+# -----------------------------
+df = pd.read_csv("Volume_Weight_Prediction_Model.csv")
+
+df.columns = df.columns.str.strip().str.lower()
+
+# Compute Volume = Sets * Reps
+if "sets" in df.columns and "reps" in df.columns:
+    df["volume"] = df["sets"] * df["reps"]
+
+# Ensure numeric
+numeric_cols = ["rpe", "volume", "weight"]
+df[numeric_cols] = df[numeric_cols].astype(float)
+
+# Sort and compute future shifts
+df = df.sort_values(by=["exercise", "week"]).reset_index(drop=True)
+df["weight_next"] = df.groupby("exercise")["weight"].shift(-1)
+df["reps_next"] = df.groupby("exercise")["reps"].shift(-1)
+df["volume_next"] = df.groupby("exercise")["volume"].shift(-1)
+
+# Compute deltas
+df["deltaweight_next"] = df["weight_next"] - df["weight"]
+df["deltareps_next"] = df["reps_next"] - df["reps"]
+
+# Drop missing "next" rows
+df = df.dropna(subset=["weight_next", "reps_next", "volume_next"])
+
+print("\n===== Missing Values =====")
+print(df.isnull().sum())
+
+print("\n===== Dataset Info =====")
+print(df.info())
+print("\n===== Dataset Head =====")
+print(df.head())
+print("\n===== Descriptive Statistics =====")
+print(df.describe())
+
+# -----------------------------
+# 2. Features and targets
+# -----------------------------
+X = df[["rpe", "volume", "weight"]].copy()
+y_volume = df["volume_next"]
+y_dweight = df["deltaweight_next"]
+y_dreps = df["deltareps_next"]
+
+scaler_X = StandardScaler()
+X_scaled = pd.DataFrame(scaler_X.fit_transform(X), columns=X.columns)
+
+# -----------------------------
+# 3. Train/Test split + evaluation
+# -----------------------------
+X_train, X_test, yv_train, yv_test = train_test_split(X_scaled, y_volume, test_size=0.2, random_state=42)
+_, _, yd_train, yd_test = train_test_split(X_scaled, y_dweight, test_size=0.2, random_state=42)
+_, _, yr_train, yr_test = train_test_split(X_scaled, y_dreps, test_size=0.2, random_state=42)
+
+# Train models
+rf_volume = RandomForestRegressor(n_estimators=100, random_state=42)
+rf_volume.fit(X_train, yv_train)
+y_pred_vol = rf_volume.predict(X_test)
+
+rf_dweight = RandomForestRegressor(n_estimators=100, random_state=42)
+rf_dweight.fit(X_train, yd_train)
+y_pred_dw = rf_dweight.predict(X_test)
+
+rf_dreps = RandomForestRegressor(n_estimators=100, random_state=42)
+rf_dreps.fit(X_train, yr_train)
+y_pred_dr = rf_dreps.predict(X_test)
+
+# Evaluation
+def get_rmse(y_true, y_pred):
+    try:
+        return mean_squared_error(y_true, y_pred, squared=False)
+    except TypeError:
+        return np.sqrt(mean_squared_error(y_true, y_pred))
+
+rmse_vol = get_rmse(yv_test, y_pred_vol)
+rmse_dw = get_rmse(yd_test, y_pred_dw)
+rmse_dr = get_rmse(yr_test, y_pred_dr)
+
+print(f"\n===== Model Evaluation =====")
+print(f"Volume RMSE: {rmse_vol:.2f}")
+print(f"ΔWeight RMSE: {rmse_dw:.2f}")
+print(f"ΔReps RMSE: {rmse_dr:.2f}")
+
+# -----------------------------
+# 4. Retrain on full dataset
+# -----------------------------
+rf_volume.fit(X_scaled, y_volume)
+rf_dweight.fit(X_scaled, y_dweight)
+rf_dreps.fit(X_scaled, y_dreps)
+
+# -----------------------------
+# 5. SHAP Analysis
+# -----------------------------
+explainer_vol = shap.TreeExplainer(rf_volume)
+shap_values_vol = explainer_vol.shap_values(X_scaled)
+plt.title("SHAP Summary Plot (Volume Prediction)")
+shap.summary_plot(shap_values_vol, X_scaled, plot_type="dot", show=False)
+plt.tight_layout()
+plt.savefig("shap_summary_volume.png")
+plt.show()
+
+explainer_dw = shap.TreeExplainer(rf_dweight)
+shap_values_dw = explainer_dw.shap_values(X_scaled)
+plt.title("SHAP Summary Plot (ΔWeight Prediction)")
+shap.summary_plot(shap_values_dw, X_scaled, plot_type="dot", show=False)
+plt.tight_layout()
+plt.savefig("shap_summary_dweight.png")
+plt.show()
+
+# -----------------------------
+# 6. Predicted vs Measured Plots
+# -----------------------------
+targets = {
+    "Volume_next": (y_volume, rf_volume),
+    "ΔWeight_next": (y_dweight, rf_dweight),
+    "ΔReps_next": (y_dreps, rf_dreps)
+}
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+axes = axes.flatten()
+
+for i, (label, (y_true_all, model)) in enumerate(targets.items()):
+    X_tr, X_te, y_tr, y_te = train_test_split(X_scaled, y_true_all, test_size=0.2, random_state=42)
+    y_hat = model.predict(X_te)
+    ax = axes[i]
+    ax.scatter(y_te, y_hat, alpha=0.3, edgecolor="k")
+    ax.plot([y_te.min(), y_te.max()], [y_te.min(), y_te.max()], "r--", lw=2)
+    r2 = r2_score(y_te, y_hat)
+    rmse = get_rmse(y_te, y_hat)
+    ax.set_title(f"{label}\n$R^2$ = {r2:.2f}, RMSE = {rmse:.2f}")
+    ax.set_xlabel("Measured")
+    ax.set_ylabel("Predicted")
+
+plt.tight_layout()
+plt.savefig("predicted_vs_measured.png")
+plt.show()
